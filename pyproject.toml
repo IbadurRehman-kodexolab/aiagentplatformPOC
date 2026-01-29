@@ -1,7 +1,7 @@
 [project]
 name = "aiagentplatformpocfinal"
 version = "0.1.0"
-description = "Add your description here"
+description = "A proof-of-concept multi-agent platform built with LangChain and LangGraph for intelligent workflow orchestration"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,3 +11,11 @@ dependencies = [
     "langgraph-prebuilt>=1.0.7",
     "python-dotenv>=1.2.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/IbadurRehman-kodexolab/aiagentplatformPOC"
+Repository = "https://github.com/IbadurRehman-kodexolab/aiagentplatformPOC"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  aiagent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aiagent-platform
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    env_file:
+      - .env
+    volumes:
+      # Mount source code for development (comment out for production)
+      - ./src:/app/src
+      - ./main.py:/app/main.py
+    restart: unless-stopped
+    # For interactive mode, uncomment:
+    # stdin_open: true
+    # tty: true
+    command: python src/agent_builder.py
+
+  # Optional: Development container with shell access
+  aiagent-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aiagent-platform-dev
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+    profiles:
+      - dev

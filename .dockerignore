@@ -1,0 +1,63 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv
+venv/
+ENV/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+wheels/
+
+# Environment variables
+.env
+.envrc
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+!README.md
+
+# Generated files
+graph.png
+*.png
+*.jpg
+*.jpeg
+
+# Tests
+tests/
+test_*/
+*_test.py
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
