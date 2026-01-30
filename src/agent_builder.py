@@ -1,213 +1,227 @@
-from template import multi_agent_template
-from langchain.agents import create_agent
-from tool_builder import tools
-from langchain.messages import AIMessage, ToolMessage
-from langchain.tools import tool, ToolRuntime
-from langgraph.types import Command
-from dotenv import load_dotenv
-from langgraph.graph import StateGraph, START, END
-from langchain.agents import AgentState
-from langchain.messages import HumanMessage
+import os
+import time
 
+from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain.tools import tool
+from langchain_core.messages import HumanMessage
+from langgraph.graph import END, START, MessagesState, StateGraph
+
+from tool_builder import tools
 
 load_dotenv()
 
-handoff_tools = []
 
-
-def build_agent(template):
-    return NodeBuilder(template)
-
-
-def get_tools(node, handoff_tools_usage=False):
-    # only return the tools that are in the node config
-    print(f"Node: {node}")
-    # print(f"Handoff tools: {handoff_tools_usage}")
+def get_tools(node):
+    """Get tools for a node"""
     selected_tools = [tool for tool in tools if tool.name in node["config"]["tools"]]
-    print(f"Selected tools: {selected_tools}")
-    if handoff_tools_usage:
-        list_of_handoff_tools_names = [
-            handoff_tool.name for handoff_tool in handoff_tools
-        ]
-        for subagent in node["config"]["subagents"]:
-            print(f"Subagent: {subagent}")
-            if subagent in list_of_handoff_tools_names:
-                selected_tools.append(
-                    handoff_tools[list_of_handoff_tools_names.index(subagent)]
-                )
-                print(
-                    f"Added handoff tool: {handoff_tools[list_of_handoff_tools_names.index(subagent)].name}"
-                )
-            else:
-                print(f"Subagent {subagent} not found in handoff tools")
-
     return selected_tools
 
 
-def create_handoff_tool(agent_name, agent_description, return_direct=False):
-
-    @tool(description=agent_description, return_direct=return_direct)
-    def handoff_tool(runtime: ToolRuntime) -> Command:
-        last_ai_message = next(
-            msg
-            for msg in reversed(runtime.state["messages"])
-            if isinstance(msg, AIMessage)
-        )
-        transfer_message = ToolMessage(
-            content=f"Transferring to {agent_name}",
-            tool_call_id=runtime.tool_call_id,
-        )
-        return Command(
-            goto=agent_name,
-            update={
-                "active_agent": agent_name,
-                "messages": [last_ai_message, transfer_message],
-            },
-            graph=Command.PARENT,
-        )
-
-    handoff_tool.name = agent_name
-
-    print(f"Created handoff tool: {handoff_tool.name}")
-    return handoff_tool
+def _has_end_edge(node_id, edges):
+    """True if this node has an outgoing edge to end_node."""
+    return any(e["from"] == node_id and e["to"] == "end_node" for e in edges)
 
 
-def NodeBuilder(template):
-    """Build agents from template - first create agents without subagents, then agents with subagents"""
+def build_agents_from_template(template):
+    """Build agents from template - wrapping sub-agents as tools"""
     workflow_nodes = template["workflow"]["nodes"]
+    workflow_edges = template["workflow"]["edges"]
     default_model = template["workflow"]["global_config"]["default_model"]
 
-    created_agents = {}
-
-    # Separate nodes into agent nodes and other nodes
     agent_nodes = [
-        node for node in workflow_nodes if node["type"] in ["agent_node", "triage_node"]
+        node
+        for node in workflow_nodes
+        if node["type"] == "agent_node"
     ]
 
-    # First pass: Create agents without subagents
-    agents_without_subagents = [
-        node for node in agent_nodes if not node["config"].get("subagents", [])
-    ]
+    created_agents = {}
+    created_agent_tools = {}
 
-    for node in agents_without_subagents:
+    # Step 1: Create all leaf agents (those without subagents)
+    leaf_agents = {}
+    for node in agent_nodes:
+        if not node["config"].get("subagents", []):
+            config = node["config"]
+            node_tools = get_tools(node)
+
+            agent = create_agent(
+                model=config.get("model", default_model),
+                tools=node_tools,
+                system_prompt=config.get("system_prompt", ""),
+            )
+
+            leaf_agents[node["name"]] = agent
+            created_agents[node["id"]] = agent
+
+    # Step 2: Wrap leaf agents as tools
+    for node in agent_nodes:
+        if not node["config"].get("subagents", []):
+            agent_name = node["name"]
+            agent_description = node["description"]
+            agent = leaf_agents[agent_name]
+            return_direct = _has_end_edge(node["id"], workflow_edges)
+
+            # Create a tool that wraps this agent
+            def create_agent_tool(agent_instance, name, desc, return_direct):
+                @tool(name, description=desc, return_direct=return_direct)
+                def agent_tool(request: str) -> str:
+                    result = agent_instance.invoke(
+                        {"messages": [{"role": "user", "content": request}]}
+                    )
+                    return result["messages"][-1].content
+
+                agent_tool.name = name
+                return agent_tool
+
+            wrapped_tool = create_agent_tool(
+                agent, agent_name, agent_description, return_direct
+            )
+            created_agent_tools[agent_name] = wrapped_tool
+
+    # Step 3: Create parent agents with wrapped sub-agent tools
+    for node in agent_nodes:
         config = node["config"]
-        node_tools = get_tools(node=node, handoff_tools_usage=False)
 
-        agent = create_agent(
-            model=config.get("model", default_model),
-            tools=node_tools,
-            system_prompt=config.get("system_prompt", ""),
-            name=node["name"],
-        )
+        if config.get("subagents"):
+            node_tools = get_tools(node)
 
-        created_agents[node["id"]] = agent
+            # Add wrapped sub-agent tools
+            for subagent_name in config["subagents"]:
+                if subagent_name in created_agent_tools:
+                    node_tools.append(created_agent_tools[subagent_name])
 
-        handoff_tool = create_handoff_tool(node["name"], node["description"])
+            # Create parent agent with all tools (including wrapped sub-agents)
+            agent = create_agent(
+                model=config.get("model", default_model),
+                tools=node_tools,
+                system_prompt=config.get("system_prompt", ""),
+            )
 
-        handoff_tools.append(handoff_tool)
-
-    # Second pass: Create agents with subagents
-    agents_with_subagents = [
-        node for node in agent_nodes if node["config"].get("subagents", [])
-    ]
-
-    for node in agents_with_subagents:
-        config = node["config"]
-        node_tools = get_tools(node=node, handoff_tools_usage=True)
-
-        agent = create_agent(
-            model=config.get("model", default_model),
-            tools=node_tools,
-            system_prompt=config.get("system_prompt", ""),
-            name=node["name"],
-        )
-        # print(f"Created agent: {agent.name}")
-        created_agents[node["id"]] = agent
+            created_agents[node["id"]] = agent
 
     return created_agents
 
 
-# def GraphBuilder(created_agents, template):
-#     """Build the graph from the created agents according to template edges"""
-#     graph = StateGraph(AgentState)
+def build_workflow_graph(created_agents, template):
+    """Build the workflow graph dynamically from template"""
+    workflow_graph = StateGraph(MessagesState)
 
-#     # Create a mapping of node IDs to agent names
-#     id_to_name = {}
-#     for node in template["workflow"]["nodes"]:
-#         if node["type"] in ["agent_node", "triage_node"]:
-#             id_to_name[node["id"]] = node["name"]
-
-#     # Add all agent nodes to the graph
-#     for agent_id, agent in created_agents.items():
-#         graph.add_node(agent.name, agent)
-
-#     # Add edges based on template
-#     for edge in template["workflow"]["edges"]:
-#         from_node = edge["from"]
-#         to_node = edge["to"]
-
-#         # Handle START node
-#         if from_node == "start_node":
-#             if to_node in id_to_name:
-#                 graph.add_edge(START, id_to_name[to_node])
-#         # Handle END node
-#         elif to_node == "end_node":
-#             if from_node in id_to_name:
-#                 graph.add_edge(id_to_name[from_node], END)
-#         # Handle agent-to-agent edges
-#         elif from_node in id_to_name and to_node in id_to_name:
-#             graph.add_edge(id_to_name[from_node], id_to_name[to_node])
-
-#     graph = graph.compile()
-
-#     # Draw graph without xray to show agent names clearly
-#     graph.get_graph().draw_mermaid_png(output_file_path="graph.png")
-
-#     return graph
-
-
-def SimpleGraphBuilder(created_agents, template):
-    """Build a simple graph from the created agents"""
-    graph = StateGraph(AgentState)
-
-    # Create a mapping of node IDs to agent names
-    id_to_name = {}
+    # Create mapping of node IDs to agent names
+    node_id_to_agent_name = {}
     for node in template["workflow"]["nodes"]:
-        if node["type"] in ["agent_node", "triage_node"]:
-            id_to_name[node["id"]] = node["name"]
+        if node["type"] == "agent_node":
+            node_id_to_agent_name[node["id"]] = node["name"]
 
-    # Add all agent nodes to the graph
-    # for agent_id, agent in created_agents.items():
-    #     graph.add_node(agent.name, agent)
-
-    print(f"Id to name: {id_to_name}")
-
-    # Add edges based on template
+    # Determine which agent nodes are referenced in edges
+    agent_nodes_in_edges = set()
     for edge in template["workflow"]["edges"]:
-        from_node = edge["from"]
-        to_node = edge["to"]
+        source_node_id = edge["from"]
+        target_node_id = edge["to"]
+
+        for node in template["workflow"]["nodes"]:
+            if node["id"] == source_node_id and node["type"] == "agent_node":
+                agent_nodes_in_edges.add(node["name"])
+            if node["id"] == target_node_id and node["type"] == "agent_node":
+                agent_nodes_in_edges.add(node["name"])
+
+    # Add agent nodes to workflow graph
+    for agent_id, agent in created_agents.items():
+        if agent_id in node_id_to_agent_name:
+            agent_name = node_id_to_agent_name[agent_id]
+            if agent_name in agent_nodes_in_edges:
+                workflow_graph.add_node(agent_name, agent)
+
+    # Add edges to workflow graph
+    for edge in template["workflow"]["edges"]:
+        source_node_id = edge["from"]
+        target_node_id = edge["to"]
 
         # Handle START node
-        if from_node == "start_node":
-            if to_node in id_to_name:
-                graph.add_node(id_to_name[to_node], created_agents[to_node])
-                graph.add_edge(START, id_to_name[to_node])
-                graph.add_edge(id_to_name[to_node], END)
-    graph = graph.compile()
-    graph.get_graph(xray=True).draw_mermaid_png(output_file_path="graph.png")
+        if source_node_id == "start_node":
+            if target_node_id in node_id_to_agent_name and target_node_id in created_agents:
+                target_agent_name = node_id_to_agent_name[target_node_id]
+                if target_agent_name in agent_nodes_in_edges:
+                    workflow_graph.add_edge(START, target_agent_name)
 
-    return graph
+        # Handle END node
+        elif target_node_id == "end_node":
+            if source_node_id in node_id_to_agent_name and source_node_id in created_agents:
+                source_agent_name = node_id_to_agent_name[source_node_id]
+                if source_agent_name in agent_nodes_in_edges:
+                    workflow_graph.add_edge(source_agent_name, END)
+
+        # Handle agent-to-agent edges
+        elif source_node_id in node_id_to_agent_name and target_node_id in node_id_to_agent_name:
+            if source_node_id in created_agents and target_node_id in created_agents:
+                source_agent_name = node_id_to_agent_name[source_node_id]
+                target_agent_name = node_id_to_agent_name[target_node_id]
+                if source_agent_name in agent_nodes_in_edges and target_agent_name in agent_nodes_in_edges:
+                    workflow_graph.add_edge(source_agent_name, target_agent_name)
+
+    compiled_workflow = workflow_graph.compile(name=template["workflow"]["name"])
+
+    # Create graphs directory if it doesn't exist
+    graphs_dir = "graphs"
+    if not os.path.exists(graphs_dir):
+        os.makedirs(graphs_dir)
+
+    # Draw workflow visualization
+    try:
+        workflow_name = template['workflow']['name']
+        output_path = f"{graphs_dir}/{workflow_name}.png"
+        compiled_workflow.get_graph().draw_mermaid_png(output_file_path=output_path)
+    except Exception as e:
+        print(f"Could not draw workflow graph: {e}")
+
+    return compiled_workflow
+
+
+def build_agent_workflow(template):
+    """Build and compile the agent workflow graph from template"""
+    created_agents = build_agents_from_template(template)
+    workflow_graph = build_workflow_graph(created_agents, template)
+    return workflow_graph
+
+
+def build_and_run_workflow(template):
+    """Build agent workflow and run with test message"""
+    workflow_graph = build_agent_workflow(template)
+    response = workflow_graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content="I need to know my billing details my account number is 1234567890"
+                )
+            ]
+        }
+    )
+
+    for msg in response["messages"]:
+        msg.pretty_print()
+    return response
 
 
 if __name__ == "__main__":
-    created_agents = build_agent(multi_agent_template)
-    # for agent_id, agent in created_agents.items():
-    #     print(f"Agent {agent.name}: {agent}")
-    # print(f"Created {len(created_agents)} agents")
-
-    graph = SimpleGraphBuilder(created_agents, multi_agent_template)
-
-    response = graph.invoke(
-        {"messages": [HumanMessage(content="I need help with my account")]}
+    from template import (
+        multi_agent_template,
+        simple_agent_template,
+        supervisor_agent_template,
+        swarm_agent_template,
     )
-    print(response)
+
+    templates = [
+        simple_agent_template,
+        multi_agent_template,
+        supervisor_agent_template,
+        swarm_agent_template,
+    ]
+
+    for template in templates:
+        print("=" * 50)
+        start_time = time.time()
+        response = build_and_run_workflow(template)
+        end_time = time.time()
+        print(f"Workflow: {template['workflow']['name']}")
+        print(f"Time taken: {end_time - start_time:.2f} seconds")
+        print("=" * 50)
